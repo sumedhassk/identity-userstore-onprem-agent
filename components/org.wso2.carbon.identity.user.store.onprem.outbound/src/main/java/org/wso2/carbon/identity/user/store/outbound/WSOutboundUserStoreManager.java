@@ -29,9 +29,7 @@ import org.wso2.carbon.identity.user.store.common.UserStoreConstants;
 import org.wso2.carbon.identity.user.store.common.messaging.JMSConnectionException;
 import org.wso2.carbon.identity.user.store.common.messaging.JMSConnectionFactory;
 import org.wso2.carbon.identity.user.store.common.model.UserOperation;
-import org.wso2.carbon.identity.user.store.outbound.cache.UserAttributeCache;
-import org.wso2.carbon.identity.user.store.outbound.cache.UserAttributeCacheEntry;
-import org.wso2.carbon.identity.user.store.outbound.cache.UserAttributeCacheKey;
+import org.wso2.carbon.identity.user.store.outbound.cache.*;
 import org.wso2.carbon.user.api.ClaimMapping;
 import org.wso2.carbon.user.api.Properties;
 import org.wso2.carbon.user.api.Property;
@@ -48,14 +46,11 @@ import org.wso2.carbon.user.core.tenant.Tenant;
 import org.wso2.carbon.user.core.util.DatabaseUtil;
 import org.wso2.carbon.user.core.util.JDBCRealmUtil;
 import org.wso2.carbon.user.core.util.UserCoreUtil;
+import org.wso2.carbon.utils.Secret;
 
-import java.util.ArrayList;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.*;
 import javax.jms.Connection;
 import javax.jms.DeliveryMode;
 import javax.jms.Destination;
@@ -73,6 +68,8 @@ public class WSOutboundUserStoreManager extends AbstractUserStoreManager {
 
     private static Log LOGGER = LogFactory.getLog(WSOutboundUserStoreManager.class);
     private static String JMS_CORRELATIONID_FILTER = "JMSCorrelationID='%s'";
+
+    private final String SHA_256 = "SHA-256";
 
     public WSOutboundUserStoreManager() {
 
@@ -163,19 +160,69 @@ public class WSOutboundUserStoreManager extends AbstractUserStoreManager {
 
     @Override
     public boolean doAuthenticate(String userName, Object credential) throws UserStoreException {
-
+        Date startDate = new Date();
         if (LOGGER.isDebugEnabled()) {
             LOGGER.debug("Processing authentication request for tenantId  - [" + this.tenantId + "]");
         }
 
         if (userName != null && credential != null) {
-            return processAuthenticationRequest(userName, credential);
+            Secret secret = (Secret) credential;
+            String identifier;
+            try {
+                identifier = getSha256SecuredIdentifier(String.copyValueOf(secret.getChars()));
+            } catch (NoSuchAlgorithmException e) {
+                LOGGER.error("Error occurred while generating identifier.", e);
+                return false;
+            }
+            UserAuthCacheKey userAuthCacheKey = new UserAuthCacheKey(userName);
+            UserAuthCacheEntry userAuthCacheEntry = UserAuthCache.getInstance().getValueFromCache(userAuthCacheKey);
+
+            if (userAuthCacheEntry != null) {
+                if (identifier.equals(userAuthCacheEntry.getUserIdentifier())) {
+                    if (LOGGER.isDebugEnabled()) {
+                        LOGGER.debug("Cache hit for user : " + userName + ". Authentication completed in "
+                                + (new Date().getTime() - startDate.getTime()) + "ms.");
+                    }
+                    return true;
+                } else {
+                    UserAuthCache.getInstance().clearCacheEntry(userAuthCacheKey);
+                }
+            }
+
+            boolean isAuthenticated = processAuthenticationRequest(userName, credential);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Authentication the user:" + userName + " completed with result:"
+                        + isAuthenticated + " in " + (new Date().getTime() - startDate.getTime()) + "ms.");
+            }
+            if (isAuthenticated) {
+                String lockedString = userName + "@WSOutboundUserStoreManager_doAuthenticate";
+                synchronized (lockedString.intern()) {
+                    if (UserAuthCache.getInstance().getValueFromCache(userAuthCacheKey) == null) {
+                        UserAuthCache.getInstance().addToCache(userAuthCacheKey, new UserAuthCacheEntry(identifier));
+                    }
+                }
+            }
+
+            return isAuthenticated;
         }
         return false;
     }
 
-    private boolean processAuthenticationRequest(String userName, Object credential) {
+    private String getSha256SecuredIdentifier(String originalIdentifier) throws NoSuchAlgorithmException {
+        String sha256Identifier;
+        MessageDigest md = MessageDigest.getInstance(SHA_256);
+        md.update(originalIdentifier.getBytes());
+        byte[] hashInBytes = md.digest();
+        StringBuilder sb = new StringBuilder();
+        for (byte b : hashInBytes) {
+            sb.append(String.format("%02x", b));
+        }
+        sha256Identifier = sb.toString();
+        return sha256Identifier;
+    }
 
+    private boolean processAuthenticationRequest(String userName, Object credential) {
+        Date startDate = new Date();
         JMSConnectionFactory connectionFactory = new JMSConnectionFactory();
         Connection connection = null;
         Session requestSession;
@@ -191,12 +238,18 @@ public class WSOutboundUserStoreManager extends AbstractUserStoreManager {
             connectionFactory.createActiveMQConnectionFactory(getMessageBrokerURL());
             connection = connectionFactory.createConnection();
             connectionFactory.start(connection);
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("JMS connection created in " + (new Date().getTime() - startDate.getTime()) + "ms.");
+            }
             requestSession = connectionFactory.createSession(connection);
             requestTopic = connectionFactory
                     .createTopicDestination(requestSession, UserStoreConstants.TOPIC_NAME_REQUEST);
             producer = connectionFactory
                     .createMessageProducer(requestSession, requestTopic, DeliveryMode.NON_PERSISTENT);
-
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("JMS connection and producer created in " +
+                        (new Date().getTime() - startDate.getTime()) + "ms.");
+            }
             Message responseMessage = null;
             int retryCount = 0;
             while (responseMessage == null && getMessageRetryLimit() > retryCount) {
@@ -207,21 +260,28 @@ public class WSOutboundUserStoreManager extends AbstractUserStoreManager {
                 String correlationId = UUID.randomUUID().toString();
                 responseQueue = connectionFactory
                         .createQueueDestination(requestSession, UserStoreConstants.QUEUE_NAME_RESPONSE);
-
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("JMS connection,producer and destination queue created in "
+                            + (new Date().getTime() - startDate.getTime()) + "ms.");
+                }
                 addNextUserOperationToTopic(correlationId, UserStoreConstants.UM_OPERATION_TYPE_AUTHENTICATE,
                         MessageRequestUtil.getAuthenticationRequest(userName, credential), requestSession, producer,
                         responseQueue);
-
+                if (LOGGER.isDebugEnabled()) {
+                    LOGGER.debug("Authentication request published to tpoic in " +
+                            (new Date().getTime() - startDate.getTime()) + "ms.");
+                }
                 responseSession = connectionFactory.createSession(connection);
 
                 String filter = String.format(JMS_CORRELATIONID_FILTER, correlationId);
                 MessageConsumer consumer = responseSession.createConsumer(responseQueue, filter);
+                Date startReceiveTime = new Date();
                 responseMessage = consumer.receive(getMessageConsumeTimeout());
                 retryCount++;
                 if (LOGGER.isDebugEnabled() && responseMessage != null) {
                     LOGGER.debug("Received response for user operation : " + UserStoreConstants
                             .UM_OPERATION_TYPE_AUTHENTICATE + " correlationId : " + correlationId + " tenant id " +
-                            ": " + tenantId);
+                            ": " + tenantId + " in " + (new Date().getTime() - startReceiveTime.getTime()) + "ms.");
                 }
             }
 
@@ -367,9 +427,15 @@ public class WSOutboundUserStoreManager extends AbstractUserStoreManager {
         String myDomainName = getMyDomainName();
 
         for (ClaimMapping mapping : claimMappings) {
-            queryBuilder.append(",").append(mapping.getMappedAttribute(myDomainName));
+            if (mapping.getMappedAttribute(myDomainName) != null) {
+                queryBuilder.append(",").append(mapping.getMappedAttribute(myDomainName));
+            }
         }
-        return queryBuilder.toString().replaceFirst(",", "");
+        String attributeList = queryBuilder.toString().replaceFirst(",", "");
+        if (LOGGER.isDebugEnabled()) {
+            LOGGER.debug("Requested Attributes list: " + attributeList);
+        }
+        return attributeList;
     }
 
     public Map<String, String> getUserPropertyValues(String userName, String[] propertyNames, String profileName)
@@ -406,7 +472,8 @@ public class WSOutboundUserStoreManager extends AbstractUserStoreManager {
 
                 while (responseMessage == null && getMessageRetryLimit() > retryCount) {
                     if (LOGGER.isDebugEnabled()) {
-                        LOGGER.debug("Trying to get user properties for user: " + userName + " count: " + retryCount);
+                        LOGGER.debug("Trying to get user properties [" + Arrays.toString(propertyNames) +  "]" +
+                                "  for user: " + userName + " count: " + retryCount);
                     }
                     String correlationId = UUID.randomUUID().toString();
                     responseQueue = connectionFactory
